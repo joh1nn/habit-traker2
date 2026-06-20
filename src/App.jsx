@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid } from "recharts";
+import { supabase } from "./supabaseClient";
+import Auth from "./Auth";
 
 const PALETTE = ["#7C6EFA","#FA6E79","#3ECFAC","#F7A325","#5BC8F5","#A8E06B","#F953C6","#4FACFE","#FF6B6B","#C39BD3"];
 const CATEGORIES = ["Sog'liq","O'qish","Sport","Ish","Shaxsiy","Ijodiyot","Ovqat","Uyqu"];
@@ -585,9 +587,104 @@ const NAV=[
   {id:"stats",    icon:"📊",label:"Statistika"},
 ];
 
-export default function App(){
-  const [habits,setHabits]=useState(()=>load("hb_habits",[]));
-  const [logs,setLogs]    =useState(()=>load("hb_logs",{}));
+// ── Supabase data helpers ───────────────────────────────────────────────────
+async function fetchHabits(userId) {
+  const { data, error } = await supabase.from("habits").select("*").eq("user_id", userId).order("created_at");
+  if (error) { console.error(error); return []; }
+  return data.map(h => ({
+    id: h.id, name: h.name, icon: h.icon, color: h.color, category: h.category,
+    frequency: h.frequency, customDays: h.custom_days || [], goal: h.goal,
+    note: h.note || "", reminderOn: h.reminder_on, reminderTime: h.reminder_time,
+  }));
+}
+
+async function fetchLogs(userId) {
+  const { data, error } = await supabase.from("logs").select("*").eq("user_id", userId);
+  if (error) { console.error(error); return {}; }
+  const logs = {};
+  data.forEach(l => {
+    if (!logs[l.habit_id]) logs[l.habit_id] = {};
+    logs[l.habit_id][l.date] = l.done;
+  });
+  return logs;
+}
+
+async function dbInsertHabit(userId, habit) {
+  const { error } = await supabase.from("habits").insert({
+    id: habit.id, user_id: userId, name: habit.name, icon: habit.icon, color: habit.color,
+    category: habit.category, frequency: habit.frequency, custom_days: habit.customDays,
+    goal: habit.goal, note: habit.note, reminder_on: habit.reminderOn, reminder_time: habit.reminderTime,
+  });
+  if (error) console.error(error);
+}
+
+async function dbUpdateHabit(userId, habit) {
+  const { error } = await supabase.from("habits").update({
+    name: habit.name, icon: habit.icon, color: habit.color, category: habit.category,
+    frequency: habit.frequency, custom_days: habit.customDays, goal: habit.goal,
+    note: habit.note, reminder_on: habit.reminderOn, reminder_time: habit.reminderTime,
+  }).eq("id", habit.id).eq("user_id", userId);
+  if (error) console.error(error);
+}
+
+async function dbDeleteHabit(userId, habitId) {
+  await supabase.from("logs").delete().eq("habit_id", habitId).eq("user_id", userId);
+  const { error } = await supabase.from("habits").delete().eq("id", habitId).eq("user_id", userId);
+  if (error) console.error(error);
+}
+
+async function dbToggleLog(userId, habitId, day, newValue) {
+  if (newValue) {
+    const { error } = await supabase.from("logs").upsert(
+      { user_id: userId, habit_id: habitId, date: day, done: true },
+      { onConflict: "user_id,habit_id,date" }
+    );
+    if (error) console.error(error);
+  } else {
+    const { error } = await supabase.from("logs").delete()
+      .eq("user_id", userId).eq("habit_id", habitId).eq("date", day);
+    if (error) console.error(error);
+  }
+}
+
+// ── App Wrapper: handles auth state ─────────────────────────────────────────
+export default function AppWrapper() {
+  const [session, setSession] = useState(undefined); // undefined = loading, null = logged out
+  const [showApp, setShowApp] = useState(false);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  if (session === undefined) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#0c0c1a", display: "flex",
+        alignItems: "center", justifyContent: "center", color: "#666", fontFamily: "Inter,sans-serif" }}>
+        Yuklanmoqda...
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <Auth onLoggedIn={() => {}} />;
+  }
+
+  return <App session={session} />;
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App({ session }){
+  const userId = session.user.id;
+  const userEmail = session.user.email;
+  const [habits,setHabits]=useState([]);
+  const [logs,setLogs]    =useState({});
+  const [loadingData,setLoadingData]=useState(true);
   const [page,setPage]    =useState("dashboard");
   const [modal,setModal]  =useState(null);
   const [toast,setToast]  =useState(null);
@@ -596,8 +693,16 @@ export default function App(){
   );
   const isMobile=useIsMobile();
 
-  useEffect(()=>{ save("hb_habits",habits); },[habits]);
-  useEffect(()=>{ save("hb_logs",logs); },[logs]);
+  // Initial load from Supabase
+  useEffect(()=>{
+    let active = true;
+    (async () => {
+      setLoadingData(true);
+      const [h, l] = await Promise.all([fetchHabits(userId), fetchLogs(userId)]);
+      if (active) { setHabits(h); setLogs(l); setLoadingData(false); }
+    })();
+    return () => { active = false; };
+  },[userId]);
 
   function showToast(msg){ setToast(msg); setTimeout(()=>setToast(null),2200); }
 
@@ -637,18 +742,26 @@ export default function App(){
   },[habits,logs,notifPermission]);
 
   const toggleLog=useCallback((id,day)=>{
-    setLogs(p=>({...p,[id]:{...(p[id]||{}),[day]:!p[id]?.[day]}}));
-  },[]);
+    setLogs(p=>{
+      const newVal = !p[id]?.[day];
+      dbToggleLog(userId, id, day, newVal);
+      return {...p,[id]:{...(p[id]||{}),[day]:newVal}};
+    });
+  },[userId]);
 
   function saveHabit(data){
     if(data.reminderOn && notifPermission!=="granted"){
       requestNotifPermission();
     }
     if(modal&&modal!=="add"){
-      setHabits(p=>p.map(h=>h.id===modal.id?{...h,...data}:h));
+      const updated = {...modal,...data};
+      setHabits(p=>p.map(h=>h.id===modal.id?updated:h));
+      dbUpdateHabit(userId, updated);
       showToast("✅ Yangilandi");
     } else {
-      setHabits(p=>[...p,{id:Date.now().toString(),...data}]);
+      const newHabit = {id:Date.now().toString(),...data};
+      setHabits(p=>[...p,newHabit]);
+      dbInsertHabit(userId, newHabit);
       showToast("🎉 Qo'shildi!");
     }
     setModal(null);
@@ -656,12 +769,25 @@ export default function App(){
   function deleteHabit(id){
     setHabits(p=>p.filter(h=>h.id!==id));
     setLogs(p=>{ const n={...p}; delete n[id]; return n; });
+    dbDeleteHabit(userId, id);
     showToast("🗑 O'chirildi");
+  }
+  async function handleLogout(){
+    await supabase.auth.signOut();
   }
 
   const today=todayStr();
   const due=habits.filter(isDueToday);
   const done=due.filter(h=>logs[h.id]?.[today]);
+
+  if (loadingData) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#0c0c1a", display: "flex",
+        alignItems: "center", justifyContent: "center", color: "#666", fontFamily: "Inter,sans-serif" }}>
+        Ma'lumotlar yuklanmoqda...
+      </div>
+    );
+  }
 
   return(
     <div style={{minHeight:"100vh",background:"#0c0c1a",color:"#e0e0f0",
@@ -695,10 +821,17 @@ export default function App(){
               </button>
             ))}
           </nav>
-          <div style={{padding:"0 10px 20px"}}>
+          <div style={{padding:"0 10px 14px"}}>
             <button onClick={()=>setModal("add")} style={{width:"100%",padding:11,borderRadius:12,
               border:"1.5px dashed #2a2a4a",background:"transparent",color:"#7C6EFA",
               fontSize:13,fontWeight:600,cursor:"pointer"}}>+ Yangi odat</button>
+          </div>
+          <div style={{padding:"12px 16px",borderTop:"1px solid #1e1e35"}}>
+            <div style={{fontSize:11,color:"#666",marginBottom:8,wordBreak:"break-all"}}>{userEmail}</div>
+            <button onClick={handleLogout} style={{
+              width:"100%",padding:"8px",borderRadius:10,border:"1px solid #2a2a3e",
+              background:"transparent",color:"#888",fontSize:12,cursor:"pointer"
+            }}>Chiqish</button>
           </div>
         </div>
       )}
@@ -716,6 +849,8 @@ export default function App(){
             </div>
             <button onClick={()=>setModal("add")} style={{background:"#7C6EFA",color:"#fff",border:"none",
               borderRadius:12,padding:"9px 16px",fontSize:13,fontWeight:700,cursor:"pointer"}}>+ Odat</button>
+            <button onClick={handleLogout} style={{background:"none",border:"none",color:"#555",
+              fontSize:18,cursor:"pointer",padding:"6px 4px",marginLeft:6}}>⏻</button>
           </div>
         )}
 
