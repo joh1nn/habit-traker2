@@ -1,0 +1,11 @@
+{
+  "name": "HabitFlow - Odat kuzatuvchisi",
+  "short_name": "HabitFlow",
+  "description": "Kunlik odatlaringizni kuzating, statistikani ko'ring va eslatma oling",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0c0c1a",
+  "theme_color": "#0c0c1a",
+  "orientation": "portrait",
+  "icons": []
+}
